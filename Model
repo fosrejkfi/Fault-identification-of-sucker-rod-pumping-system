@@ -1,0 +1,269 @@
+from torch import nn
+import torch
+from typing import List, Optional  
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _make_divisible(ch: float, divisor: int = 8, min_ch: Optional[int] = None) -> int:
+
+    if min_ch is None:
+        min_ch = divisor
+    new_ch = max(min_ch, int(ch + divisor / 2) // divisor * divisor)
+
+    if new_ch < 0.9 * ch:
+        new_ch += divisor
+    return new_ch
+
+
+class CA_Block(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(CA_Block, self).__init__()
+
+        self.avg_pool_x = nn.AdaptiveAvgPool2d((None, 1))
+        self.avg_pool_y = nn.AdaptiveAvgPool2d((1, None))
+
+
+        self.conv_1x1 = nn.Conv2d(in_channels=channel, out_channels=channel // reduction,
+                                  kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn = nn.BatchNorm2d(channel // reduction)
+        self.relu = nn.ReLU6(inplace=True)
+
+
+        self.conv_x = nn.Conv2d(in_channels=channel // reduction, out_channels=channel,
+                                kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv_y = nn.Conv2d(in_channels=channel // reduction, out_channels=channel,
+                                kernel_size=1, stride=1, padding=0, bias=False)
+
+
+        self.sigmoid_x = nn.Sigmoid()
+        self.sigmoid_y = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.size()
+
+        x_h = self.avg_pool_x(x) 
+        x_w = self.avg_pool_y(x).permute(0, 1, 3, 2)  
+
+
+        x_cat = torch.cat((x_h, x_w), dim=2)  
+        x_cat_conv = self.conv_1x1(x_cat)
+        x_cat_conv_bn = self.bn(x_cat_conv)
+        x_cat_conv_relu = self.relu(x_cat_conv_bn)
+
+
+        x_conv_split_x, x_conv_split_y = torch.split(x_cat_conv_relu, [h, w], dim=2)
+        x_conv_split_y = x_conv_split_y.permute(0, 1, 3, 2) 
+
+       
+        x_att_x = self.sigmoid_x(self.conv_x(x_conv_split_x)) 
+        x_att_y = self.sigmoid_y(self.conv_y(x_conv_split_y))  
+       
+        out = x * x_att_x * x_att_y
+        return out
+
+
+class LeakyReLU6(nn.Module):
+    
+
+    def __init__(self, negative_slope: float = 0.1, inplace: bool = False):
+
+        super(LeakyReLU6, self).__init__()
+      
+        self.negative_slope = negative_slope
+       
+        self.inplace = inplace
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+      
+        leaky_output = F.leaky_relu(
+            input=x,
+            negative_slope=self.negative_slope,
+            inplace=self.inplace
+        )
+
+        
+        output = torch.clamp(leaky_output, max=6.0)
+
+        return output
+
+
+
+class LightweightInceptionV2(nn.Module):
+
+
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+       
+        inter_ch = _make_divisible(in_channels // reduction, 8) 
+
+       
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True),
+        )
+
+       
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True),
+            nn.Conv2d(inter_ch, inter_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True)
+        )
+
+      
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True),
+            nn.Conv2d(inter_ch, inter_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True),
+            nn.Conv2d(inter_ch, inter_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True)
+        )
+
+       
+        self.branch4 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+            LeakyReLU6(negative_slope=0.1, inplace=True)
+        )
+
+       
+        self.concat_conv = nn.Sequential(
+            nn.Conv2d(inter_ch * 4, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            LeakyReLU6(negative_slope=0.1, inplace=True)
+        )
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+     
+        concat = torch.cat([b1, b2, b3, b4], dim=1)
+
+
+        out = self.concat_conv(concat) + x
+
+        return out
+
+
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, in_channel, out_channel, kernel_size=3, stride=1, groups=1):
+        padding = (kernel_size - 1) // 2
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(in_channel, out_channel, kernel_size, stride, padding, groups=groups, bias=False),
+            nn.BatchNorm2d(out_channel),
+            LeakyReLU6(negative_slope=0.1, inplace=True),
+           
+        )
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, in_channel: int, out_channel: int, stride: int, expand_ratio: float, use_ca: bool = True):
+        super(InvertedResidual, self).__init__()
+        hidden_channel = in_channel * expand_ratio
+       
+        self.use_shortcut = stride == 1 and in_channel == out_channel
+
+        layers: List[nn.Module] = []
+        if expand_ratio != 1:
+          
+            layers.append(ConvBNReLU(in_channel, int(hidden_channel), kernel_size=1))
+        layers.extend([
+         
+            ConvBNReLU(int(hidden_channel), int(hidden_channel), stride=stride,
+                       groups=int(hidden_channel)),
+         
+            nn.Conv2d(int(hidden_channel), out_channel, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channel),
+        ])
+
+        self.conv = nn.Sequential(*layers)
+
+       
+        self.use_ca = use_ca
+        if self.use_ca:
+            self.ca = CA_Block(out_channel)
+        else:
+            self.ca = None 
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv(x)
+       
+        if self.use_ca and self.ca is not None:
+            out = self.ca(out) 
+        if self.use_shortcut:
+            return x + out
+        else:
+            return out
+
+
+class MobileNetV2(nn.Module):
+   
+    def __init__(self, num_classes=1000, alpha=1, round_nearest=8, in_channels=1, use_ca: bool = True,
+                 use_inceptionv2: bool = True):
+        super(MobileNetV2, self).__init__()
+        block = InvertedResidual
+        input_channel = _make_divisible(32 * alpha, round_nearest)
+        last_channel = 1280 if alpha <= 1.0 else _make_divisible(1280 * alpha, round_nearest)
+
+        inverted_residual_setting = [
+            [1, 16, 1, 1], [6, 24, 2, 2], [6, 32, 3, 2],
+            [6, 64, 4, 2], [6, 96, 3, 1], [6, 160, 3, 2], [6, 320, 1, 1],
+        ]
+
+        features = []
+       
+        features.append(ConvBNReLU(in_channels, input_channel, stride=2))
+
+      
+        self.use_inceptionv2 = use_inceptionv2
+        if self.use_inceptionv2:
+           
+            self.inceptionv2 = LightweightInceptionV2(in_channels=input_channel, reduction=16)
+            features.append(self.inceptionv2)
+       
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c * alpha, round_nearest)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                features.append(block(input_channel, output_channel, stride, expand_ratio=t, use_ca=use_ca))
+                input_channel = output_channel
+        features.append(ConvBNReLU(input_channel, last_channel, 1))
+        self.features = nn.Sequential(*features)
+
+
+      
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(last_channel, num_classes)
+        )
+
+      
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias) 
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
